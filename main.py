@@ -513,7 +513,7 @@ class DailyNewsPlugin(Star):
                     traceback.print_exc()
                     test_results.append(f"❌ {group_id}: 异常 ({str(e)})")
             
-            result_msg = "测试发送结果:\n" + "\n".join(test_results)
+            result_msg = "测试结果:" + "\n".join(test_results)
             yield event.plain_result(result_msg)
 
         except Exception as e:
