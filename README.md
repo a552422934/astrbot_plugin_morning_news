@@ -6,11 +6,11 @@
 
 ## 📝 使用教程
 
- 1.在需要推送的群里发送`/get_config`，获取群组唯一标识符
+ 一、在需要推送的群里发送`/get_config`，获取群组唯一标识符
 
- 2.在插件配置：输入群组唯一标识符列表，设置推送时间
+ 二、在插件配置：输入群组唯一标识符列表，设置推送时间
 
- 3.在群里发送`/test_send`，测试是否成功
+ 三、在群里发送`/test_send`，测试是否成功
 
 ## ✨ 功能特性
 
@@ -28,74 +28,6 @@
 
 - 请确保在修改配置后重启插件以使更改生效(默认自动重启)。
 
-## 🛠️ 配置说明
-
-在插件配置中设置以下参数:
-
-```json
-{
-  "target_groups": {
-    "description": "需要推送早报群组唯一标识符列表",
-    "type": "list",
-    "hint": "填写需要接收60s早报推送的群组唯一标识符，如: 你的机器人名称(自己起的):GroupMessage:这里填写你的群号",
-    "default": ["QQ号1:GroupMessage:603306240, QQ号2:GroupMessage:518516787"]
-  },
-  "push_time": {
-    "description": "推送时间(以服务器时区为准)",
-    "type": "string",
-    "hint": "填写推送的时间，如: 08:00, 12:30, 18:00",
-    "default": "08:00"
-  },
-  "show_text_news": {
-    "description": "是否显示文字早报",
-    "type": "bool",
-    "hint": "是否显示文字早报，默认隐藏",
-    "default": false
-  },
-  "use_local_image_draw": {
-    "description": "是否使用本地图片绘制",
-    "type": "bool",
-    "hint": "是否使用本地图片绘制，为否则使用api获取图片",
-    "default": true
-  }
-}
-```
-
-### 🛠️ 参数说明
-
-群聊唯一标识符分为: 前缀:中缀:后缀
-
-| 参数名称             | 类型   | 默认值                                           | 描述                                          |
-| -------------------- | ------ | ------------------------------------------------ | --------------------------------------------- |
-| target_groups        | list   | ["填你设置的名称:GroupMessage:这里填写你的群号"] | 需要推送 60s 早报的群组唯一标识符列表         |
-| push_time            | string | "08:00"                                          | 推送时间(以服务器时区为准)                    |
-| show_text_news       | bool   | false                                            | 是否显示文字早报，默认隐藏                    |
-| use_local_image_draw | bool   | true                                             | 是否使用本地图片绘制，为否则使用 api 获取图片 |
-
-### AstrBot 4.0 版本及以前这样设置:
-
-**下面是所有可选的群组唯一标识符前缀:**
-
-| 平台                            | 群组唯一标识符前缀  |
-| ------------------------------- | ------------------- |
-| qq, napcat, Lagrange 之类的     | aiocqhttp           |
-| qq 官方 bot                     | qq_official         |
-| telegram                        | telegram            |
-| 钉钉                            | dingtalk            |
-| gewechat 微信(虽然已经停止维护) | gewechat            |
-| lark                            | lark                |
-| qq webhook 方法                 | qq_official_webhook |
-| astrbot 网页聊天界面            | webchat             |
-
-**下面是所有可选的群组唯一标识符中缀:**
-
-| 群组唯一标识符中缀 | 描述     |
-| ------------------ | -------- |
-| GroupMessage       | 群组消息 |
-| FriendMessage      | 私聊消息 |
-| OtherMessage       | 其他消息 |
-
-**群组唯一标识符后缀为群号, qq 号等**
 
 ## 📝 命令
 
@@ -145,6 +77,51 @@
 4. 使用 `/get_config` 命令可获取当前群组的正确 ID 格式，方便配置
 5. 使用 `/test_send` 命令可测试群组配置是否正确
 6. 如用户想自行获取早报，可使用 `/get_news` 命令手动获取
+
+## 🛠️ 配置说明
+
+在插件配置中设置以下参数:
+
+```json
+{
+  "target_groups": {
+    "description": "需要推送早报群组唯一标识符列表",
+    "type": "list",
+    "hint": "填写需要接收60s早报推送的群组唯一标识符，如: 你的机器人名称(自己起的):GroupMessage:这里填写你的群号",
+    "default": ["QQ号1:GroupMessage:603306240, QQ号2:GroupMessage:518516787"]
+  },
+  "push_time": {
+    "description": "推送时间(以服务器时区为准)",
+    "type": "string",
+    "hint": "填写推送的时间，如: 08:00, 12:30, 18:00",
+    "default": "08:00"
+  },
+  "show_text_news": {
+    "description": "是否显示文字早报",
+    "type": "bool",
+    "hint": "是否显示文字早报，默认隐藏",
+    "default": false
+  },
+  "use_local_image_draw": {
+    "description": "是否使用本地图片绘制",
+    "type": "bool",
+    "hint": "是否使用本地图片绘制，为否则使用api获取图片",
+    "default": true
+  }
+}
+```
+
+### 🛠️ 参数说明
+
+群聊唯一标识符分为: 前缀:中缀:后缀
+
+| 参数名称             | 类型   | 默认值                                           | 描述                                          |
+| -------------------- | ------ | ------------------------------------------------ | --------------------------------------------- |
+| target_groups        | list   | ["填你设置的名称:GroupMessage:这里填写你的群号"] | 需要推送 60s 早报的群组唯一标识符列表         |
+| push_time            | string | "08:00"                                          | 推送时间(以服务器时区为准)                    |
+| show_text_news       | bool   | false                                            | 是否显示文字早报，默认隐藏                    |
+| use_local_image_draw | bool   | true                                             | 是否使用本地图片绘制，为否则使用 api 获取图片 |
+
 
 ## 👥 贡献指南
 
