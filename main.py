@@ -405,19 +405,14 @@ class DailyNewsPlugin(Star):
             if len(parts) == 3:
                 prefix, middle, suffix = parts
                 help_msg = (
+                    f"完整配置格式:\n"
+                    f"请在插件配置唯一标识符中使用以下格式:\n"
+                    f"{current_origin}\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
                     f"配置格式: \n"
                     f"前缀: {prefix}\n"
                     f"中缀: {middle}\n"
                     f"后缀: {suffix}\n"
-                    f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"💡 完整配置提示:\n"
-                    f"请在插件配置中使用以下格式:\n"
-                    f"{current_origin}\n"
-                    f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"⚠️ 注意:\n"
-                    f"如果您的AstrBot版本是4.0或更高，\n"
-                    f"前缀应该是您自己起的平台名称，\n"
-                    f"而不是 'aiocqhttp'。\n"
                 )
             else:
                 help_msg = (
