@@ -10,7 +10,6 @@ try:
     from .config import CURRENT_DIR
 except ImportError:
     CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-import traceback
 
 # --- 配置常量 ---
 BASE_IMAGE_DIR = os.path.join(CURRENT_DIR, "assets")
@@ -194,8 +193,10 @@ def calculate_news_height(draw: ImageDraw.ImageDraw, news_list: list, font: Imag
     """
     total_height = 0
     for i, item in enumerate(news_list):
-        item = item.strip()
-        numbered_item = f"{i + 1}. {item}"
+        item_str = "" if item is None else str(item).strip()
+        if not item_str:
+            continue
+        numbered_item = f"{i + 1}. {item_str}"
         _, item_height = wrap_text_pixel(draw, numbered_item, font, max_width, NEWS_LINE_SPACING)
         total_height += item_height + NEWS_ITEM_SPACING
     return total_height
@@ -330,11 +331,7 @@ def create_news_image_from_data(news_api_data: Dict[str, Any], logger) -> Option
         date_area_center_y = (date_area_start_y + date_area_end_y) // 2
         
         # 解析农历日期
-        if "年" in lunar_date_str:
-            lunar_parts = lunar_date_str.split("年")
-            lunar_date_display = lunar_parts[1] if len(lunar_parts) > 1 else lunar_date_str
-        else:
-            lunar_date_display = lunar_date_str
+        # 注：之前计算 lunar_date_display 但未使用；当前直接绘制 lunar_date_str
         
         # 左侧：农历（上下居中，左对齐）
         lunar_text = lunar_date_str  # 直接使用完整农历，如"乙巳年十一月廿七"
@@ -373,8 +370,10 @@ def create_news_image_from_data(news_api_data: Dict[str, Any], logger) -> Option
         current_y = separator_y2 + NEWS_TOP_MARGIN  # 使用上边距常量
 
         for i, item in enumerate(news_list):
-            item = item.strip()
-            numbered_item = f"{i + 1}. {item}"
+            item_str = "" if item is None else str(item).strip()
+            if not item_str:
+                continue
+            numbered_item = f"{i + 1}. {item_str}"
 
             wrapped_item, _ = wrap_text_pixel(
                 draw, numbered_item, font_news, max_news_width, NEWS_LINE_SPACING
@@ -414,50 +413,10 @@ def create_news_image_from_data(news_api_data: Dict[str, Any], logger) -> Option
         return None
     except Exception as e:
         logger.error(f"[新闻图片生成] 未知错误: {e}")
-        traceback.print_exc()
+        logger.exception("[新闻图片生成] 图片生成异常")
         return None
 
 
 if __name__ == "__main__":
-    import logging
-
-    logging.basicConfig(level=logging.DEBUG)
-    logger = logging.getLogger("news_image_generator")
-
-    # 示例数据
-    example_api_data = {
-        "date": "2026-01-15",
-        "news": [
-            "2025 年我国进出口总值首破 45 万亿元，创历史新高，继续保持全球货物贸易第一大国地位",
-            "央行 1 月 15 日将开展 9000 亿元 6 月期买断式逆回购操作，为连续第 8 个月加量续作",
-            "2025 年超 1.1 万家银行线下网点关闭，同期新设网点超 8400 家，全年网点净减少逾 2000 家",
-            "三部门：换房退个税政策延期至 2027 年底，纳税人出售现住房后 1 年内重购住房可享退税优惠",
-            "南京再次放宽落户门槛：45 岁以下本科毕业可直接落户，三级及以上职业技能人员可直接落户",
-            "前程无忧报告：2025 年员工整体离职率降至 14.8%，已连续 3 年小幅走低",
-            "吉林长白山婚姻登记处上线：领证情侣终身免门票游长白山景区",
-            "多地快递驿站转让帖在线上涌现：经营者称每天工作十几个小时，每月只赚五六千",
-            "U23 亚洲杯：中国 0 比 0 战平泰国，首次以小组赛不败战绩晋级淘汰赛",
-            "数据显示：2025 年全球短剧应用内购收入超 28 亿美元，同比涨幅达 116%",
-            "阿根廷 2025 年通胀率降至近 8 年最低水平；阿根廷总统米莱称计划今年访问中国",
-            "泰媒：泰国一在建铁路起重机倒塌砸中行驶火车，已致 32 死 67 伤，涉事标段无中企参与",
-            "外媒：美国即将正式退出世卫组织，以色列宣布跟随美国退群，世卫组织谭德塞称此举威胁全球安全",
-            "美媒：美国将暂停对俄罗斯、巴西、泰国等 75 国所有签证，以打击潜在公共负担申请人",
-            "外媒：丹麦军方开始向格陵兰岛增派力量；法国将在格陵兰岛开设领事馆"
-        ],
-        "tip": "如果你曾经把失败当成清醒剂，就千万别让成功变成迷魂汤",
-        "lunar_date": "乙巳年十一月廿七"
-    }
-
-    logger.info("[测试] 开始生成新闻图片...")
-    image_base64 = create_news_image_from_data(example_api_data, logger)
-
-    if image_base64:
-        try:
-            output_filename = "generated_news_test.jpg"
-            with open(output_filename, "wb") as f:
-                f.write(base64.b64decode(image_base64))
-            logger.info(f"[测试] 新闻图片生成成功，已保存为 {output_filename}")
-        except Exception as e:
-            logger.error(f"[测试] 保存图片时发生错误: {e}")
-    else:
-        logger.error("[测试] 新闻图片生成失败")
+    # 为符合 AstrBot 插件代码规范：避免模块自测代码干扰框架日志/行为。
+    pass

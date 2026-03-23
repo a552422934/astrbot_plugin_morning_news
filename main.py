@@ -1,5 +1,4 @@
 import asyncio
-import traceback
 import aiohttp
 import datetime
 import base64
@@ -8,7 +7,6 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot.api.message_components import Plain, Image
-from astrbot.api.event.filter import EventMessageType
 from .news_image_generator import create_news_image_from_data
 
 
@@ -22,6 +20,13 @@ class DailyNewsPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
         self.config = config
+
+        # 用于在消息发送阶段做串行化，避免同一时间多处逻辑并发 send_message 造成混乱
+        self._send_lock = asyncio.Lock()
+
+        # 定时任务在 __init__ 启动可能遇到“无运行中的事件循环”风险，因此延迟启动
+        self._daily_task = None
+        self._task_start_requested = False
         
         # 清理和验证群组ID
         raw_groups = config.get("target_groups", [])
@@ -42,7 +47,8 @@ class DailyNewsPlugin(Star):
             else:
                 logger.warning(f"[每日早报] 群组ID类型错误，已跳过: {group_id} (类型: {type(group_id).__name__})")
         
-        self.push_time = config.get("push_time", "08:00")
+        self.push_time = self._normalize_push_time(config.get("push_time", "08:00"))
+        self.push_hour, self.push_minute = self._parse_push_time_to_hm(self.push_time)
         self.show_text_news = config.get("show_text_news", False)
         self.use_local_image_draw = config.get("use_local_image_draw", True)
 
@@ -54,9 +60,115 @@ class DailyNewsPlugin(Star):
         logger.info(f"[每日早报] 显示文本早报: {self.show_text_news}")
         logger.info(f"[每日早报] 使用本地图片绘制: {self.use_local_image_draw}")
 
-        # 启动定时任务
-        self._daily_task = asyncio.create_task(self.daily_task())
-        logger.info(f"[每日早报] 定时任务已创建")
+        # 启动定时任务（如果当前没有运行中的事件循环，则延迟到首次命令触发）
+        self._start_daily_task_if_possible()
+
+    def _normalize_push_time(self, raw_value) -> str:
+        """把 push_time 规范化成 'HH:MM'，非法配置回退默认值并避免 ValueError"""
+        default = "08:00"
+        try:
+            if not isinstance(raw_value, str):
+                raise ValueError("push_time must be a string")
+            value = raw_value.strip()
+            parts = value.split(":")
+            if len(parts) != 2:
+                raise ValueError("push_time format invalid")
+            hour = int(parts[0])
+            minute = int(parts[1])
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                raise ValueError("hour/minute out of range")
+            return f"{hour:02d}:{minute:02d}"
+        except Exception as e:
+            logger.warning(f"[每日早报] push_time 配置非法: {raw_value}，已回退默认值 {default}，原因: {e}")
+            return default
+
+    def _parse_push_time_to_hm(self, normalized_push_time: str) -> tuple[int, int]:
+        """输入保证为 'HH:MM' 格式，因此该函数不再做额外容错"""
+        hour_str, minute_str = normalized_push_time.split(":")
+        return int(hour_str), int(minute_str)
+
+    def _start_daily_task_if_possible(self) -> None:
+        if self._daily_task is not None and not self._daily_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            self._daily_task = loop.create_task(self.daily_task())
+            logger.info("[每日早报] 定时任务已创建")
+        except RuntimeError:
+            # 未进入运行中的事件循环，延迟到后续命令触发时再启动
+            self._task_start_requested = True
+            logger.warning("[每日早报] 当前未发现运行中的事件循环，定时任务将延迟启动")
+
+    def _ensure_daily_task_started(self) -> None:
+        if self._task_start_requested:
+            self._start_daily_task_if_possible()
+            self._task_start_requested = False
+
+    def _build_image_chain(self, image_data: str) -> MessageChain:
+        image_message_chain = MessageChain()
+        image_message_chain.chain = [Image.fromBase64(image_data)]
+        return image_message_chain
+
+    def _build_text_chain(self, text: str) -> MessageChain:
+        text_message_chain = MessageChain()
+        text_message_chain.chain = [Plain(text)]
+        return text_message_chain
+
+    async def _send_message_safely(self, origin: str, message_chain: MessageChain):
+        """统一 send_message 调用入口，控制并发与异常日志收敛"""
+        async with self._send_lock:
+            return await self.context.send_message(origin, message_chain)
+
+    def _extract_news_payload(self, raw_json):
+        """
+        把不同 API 可能返回的结构归一化为：{date: str, news: List[str], tip: str}
+        返回 None 表示无法解析
+        """
+        try:
+            if not isinstance(raw_json, dict):
+                return None
+
+            candidate = raw_json.get("data", raw_json)
+            if not isinstance(candidate, dict):
+                return None
+
+            date_str = candidate.get("date") or ""
+            news_items = candidate.get("news", [])
+            tip = candidate.get("tip") or ""
+            image_url = candidate.get("image")  # 仅当配置 use_local_image_draw=false 时需要
+
+            # 可选字段：用于提升图片绘制的准确性
+            weekday_cn = candidate.get("day_of_week")
+            lunar_date = candidate.get("lunar_date")
+
+            if isinstance(news_items, str):
+                news_items = [x for x in news_items.splitlines() if x.strip()]
+            if not isinstance(news_items, (list, tuple)):
+                news_items = []
+
+            normalized_news = []
+            for item in news_items:
+                if item is None:
+                    continue
+                s = str(item).strip()
+                if s:
+                    normalized_news.append(s)
+
+            # date 与 news 都是必要字段；tip 允许为空
+            if not date_str or not normalized_news:
+                return None
+
+            payload = {"date": str(date_str), "news": normalized_news, "tip": str(tip)}
+            if image_url:
+                payload["image"] = str(image_url)
+            if weekday_cn:
+                payload["day_of_week"] = str(weekday_cn)
+            if lunar_date:
+                payload["lunar_date"] = str(lunar_date)
+            return payload
+        except Exception as e:
+            logger.warning(f"[每日早报] 解析早报数据结构失败: {e}")
+            return None
 
     # 获取60s早报数据
     async def fetch_news_data(self):
@@ -73,13 +185,17 @@ class DailyNewsPlugin(Star):
             "https://60s-api-cf.114128.xyz/v2/60s"
         ]
 
-        async with aiohttp.ClientSession() as session:
+        timeout = aiohttp.ClientTimeout(total=12, connect=5, sock_read=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             for url in urls:
                 try:
                     async with session.get(url) as response:
                         if response.status == 200:
-                            data = await response.json()
-                            return data["data"]
+                            raw_json = await response.json(content_type=None)
+                            payload = self._extract_news_payload(raw_json)
+                            if payload:
+                                return payload
+                            logger.warning(f"[每日早报] API返回结构异常，已跳过: {url}")
                         else:
                             logger.warning(f"API返回错误代码: {response.status}")
                 except Exception as e:
@@ -99,7 +215,9 @@ class DailyNewsPlugin(Star):
         :rtype: str
         """
         try:
-            image_url = news_data["image"]
+            image_url = news_data.get("image")
+            if not image_url:
+                raise ValueError("news_data 缺少 image 字段")
             logger.info(f"[每日早报] 从URL下载图片: {image_url}")
 
             async with aiohttp.ClientSession() as session:
@@ -113,7 +231,7 @@ class DailyNewsPlugin(Star):
                     return base64_data
         except Exception as e:
             logger.error(f"[每日早报] 下载图片时出错: {e}")
-            traceback.print_exc()
+            logger.exception("[每日早报] 下载图片时异常")
             raise
 
     # 生成早报文本
@@ -124,13 +242,19 @@ class DailyNewsPlugin(Star):
         :return: 早报文本
         :rtype: str
         """
-        date = news_data["date"]
-        news_items = news_data["news"]
-        tip = news_data["tip"]
+        date = str(news_data.get("date", "") or "")
+        news_items = news_data.get("news", []) or []
+        tip = str(news_data.get("tip", "") or "")
+
+        if not isinstance(news_items, (list, tuple)):
+            news_items = [str(news_items)]
 
         text = f"【每日60秒早报】{date}\n\n"
         for i, item in enumerate(news_items, 1):
-            text += f"{i}. {item}\n"
+            s = str(item).strip()
+            if not s:
+                continue
+            text += f"{i}. {s}\n"
 
         text += f"\n【今日提示】{tip}\n"
         text += f"数据来源: 每日60秒早报"
@@ -149,17 +273,20 @@ class DailyNewsPlugin(Star):
             logger.debug(f"[每日早报] 获取到的早报数据: {news_data}")
             
             logger.info(f"[每日早报] 开始生成图片，使用本地绘制: {self.use_local_image_draw}")
-            if not self.use_local_image_draw:
-                image_data = await self.download_image(news_data)
-            else:
+            image_data = None
+            if self.use_local_image_draw:
                 image_data = create_news_image_from_data(news_data, logger)
                 if not image_data:
                     logger.error("[每日早报] 图片生成失败，可能是字体文件缺失，请检查 assets 目录中的字体文件")
-                    return
+            else:
+                image_data = await self.download_image(news_data)
+            if image_data:
                 logger.debug(
                     f"[图片生成] 生成的图片 Base64 数据前 100 字符: {image_data[:100]}"
                 )
-            logger.info("[每日早报] 图片生成成功")
+
+            if image_data:
+                logger.info("[每日早报] 图片生成成功")
 
             if not self.target_groups:
                 logger.warning("[每日早报] 未配置目标群组，无法推送")
@@ -188,85 +315,61 @@ class DailyNewsPlugin(Star):
                     
                     logger.info(f"[每日早报] 群组ID解析: 前缀={parts[0]}, 中缀={parts[1]}, 后缀={parts[2]}")
                     
-                    # 验证图片数据
-                    if not image_data:
-                        logger.error(f"[每日早报] 图片数据为空，无法发送")
-                        continue
-                    
-                    logger.debug(f"[每日早报] 图片Base64长度: {len(image_data)} 字符")
-                    logger.debug(f"[每日早报] 图片Base64前50字符: {image_data[:50]}")
-                    
-                    # 首先发送图片
-                    try:
-                        image_message_chain = MessageChain()
-                        image_message = [Image.fromBase64(image_data)]
-                        image_message_chain.chain = image_message
-                        logger.info(f"[每日早报] MessageChain已创建，chain长度: {len(image_message_chain.chain)}")
-                        logger.info(f"[每日早报] 正在向群组 {group_id} 发送图片...")
-                        
-                        # 尝试发送消息并检查返回值
-                        result = await self.context.send_message(group_id, image_message_chain)
-                        logger.info(f"[每日早报] send_message 返回结果: {result} (类型: {type(result).__name__})")
-                        
-                        # 检查返回值，False 或 None 表示发送失败
-                        if result is False or result is None:
-                            logger.error(f"[每日早报] 图片发送失败，返回值为: {result}")
-                            logger.error(f"[每日早报] 可能的原因: 群组ID无效、权限不足、或平台不支持")
-                            # 发送失败，跳过这个群组
-                            continue
-                        
-                        logger.info(f"[每日早报] 图片已成功发送到群组 {group_id}")
-                    except Exception as send_error:
-                        logger.error(f"[每日早报] send_message 调用失败: {send_error}")
-                        logger.error(f"[每日早报] 发送错误类型: {type(send_error).__name__}")
-                        logger.error(f"[每日早报] 发送错误详情:")
-                        traceback.print_exc()
-                        # 发送失败，跳过这个群组
-                        continue
+                    send_any = False
 
-                    # 如果配置了显示文本早报，则发送文本
+                    # 先发送图片（如果生成成功）
+                    if image_data:
+                        logger.debug(f"[每日早报] 图片Base64长度: {len(image_data)} 字符")
+                        logger.debug(f"[每日早报] 图片Base64前50字符: {image_data[:50]}")
+                        image_message_chain = self._build_image_chain(image_data)
+                        logger.info(f"[每日早报] 正在向群组 {group_id} 发送图片...")
+                        try:
+                            result = await self._send_message_safely(group_id, image_message_chain)
+                            logger.info(f"[每日早报] send_message 返回结果: {result} (类型: {type(result).__name__})")
+                            if result is not False and result is not None:
+                                send_any = True
+                                logger.info(f"[每日早报] 图片已成功发送到群组 {group_id}")
+                            else:
+                                logger.error(f"[每日早报] 图片发送失败，返回值为: {result}")
+                        except Exception:
+                            logger.exception(f"[每日早报] 图片发送失败，群组: {group_id}")
+
+                    # 再发送文本（按配置）
                     if self.show_text_news:
-                        text_message_chain = MessageChain()
                         text_news = self.generate_news_text(news_data)
-                        text_message = [Plain(text_news)]
-                        text_message_chain.chain = text_message
+                        text_message_chain = self._build_text_chain(text_news)
                         logger.info(f"[每日早报] 正在向群组 {group_id} 发送文本...")
                         try:
-                            result = await self.context.send_message(group_id, text_message_chain)
+                            result = await self._send_message_safely(group_id, text_message_chain)
                             logger.info(f"[每日早报] 文本send_message 返回结果: {result}")
-                            
-                            # 检查返回值
-                            if result is False or result is None:
-                                logger.warning(f"[每日早报] 文本发送失败，返回值为: {result}，但图片已发送")
-                            else:
+                            if result is not False and result is not None:
+                                send_any = True
                                 logger.info(f"[每日早报] 文本已成功发送到群组 {group_id}")
-                        except Exception as send_error:
-                            logger.error(f"[每日早报] 文本发送失败: {send_error}")
-                            logger.error(f"[每日早报] 文本发送错误类型: {type(send_error).__name__}")
-                            traceback.print_exc()
-                            # 文本发送失败不影响成功计数（图片已发送）
+                            else:
+                                logger.warning(f"[每日早报] 文本发送失败，返回值为: {result}")
+                        except Exception:
+                            logger.exception(f"[每日早报] 文本发送失败，群组: {group_id}")
 
-                    logger.info(f"[每日早报] 已成功向群 {group_id} 推送每日早报")
-                    success_count += 1
+                    if send_any:
+                        logger.info(f"[每日早报] 已成功向群 {group_id} 推送每日早报")
+                        success_count += 1
                     await asyncio.sleep(1)
                 except Exception as e:
                     logger.error(f"[每日早报] 向群组 {group_id} 推送消息时出错: {e}")
                     logger.error(f"[每日早报] 错误类型: {type(e).__name__}")
-                    traceback.print_exc()
+                    logger.exception(f"[每日早报] 群组推送异常，群组: {group_id}")
             
             logger.info(f"[每日早报] 推送完成，成功: {success_count}/{len(self.target_groups)}")
         except Exception as e:
             logger.error(f"[每日早报] 推送每日早报时出错: {e}")
             logger.error(f"[每日早报] 错误类型: {type(e).__name__}")
-            traceback.print_exc()
+            logger.exception("[每日早报] 推送每日早报时异常")
 
     # 计算到明天指定时间的秒数
     def calculate_sleep_time(self):
         """计算到下一次推送时间的秒数"""
         now = datetime.datetime.now()
-        hour, minute = map(int, self.push_time.split(":"))
-
-        target_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        target_time = now.replace(hour=self.push_hour, minute=self.push_minute, second=0, microsecond=0)
         # 如果目标时间已经过了，则设置为明天
         if target_time <= now:
             target_time += datetime.timedelta(days=1)
@@ -292,7 +395,12 @@ class DailyNewsPlugin(Star):
                     continue
                 
                 # 计算到下次推送的时间
-                sleep_time = self.calculate_sleep_time()
+                try:
+                    sleep_time = self.calculate_sleep_time()
+                except Exception as e:
+                    logger.error(f"[每日早报] 计算 sleep_time 失败: {e}，将延迟重试")
+                    await asyncio.sleep(300)
+                    continue
                 hours = int(sleep_time / 3600)
                 minutes = int((sleep_time % 3600) / 60)
                 seconds = int(sleep_time % 60)
@@ -321,7 +429,7 @@ class DailyNewsPlugin(Star):
                 
                 # 验证是否到达推送时间
                 now = datetime.datetime.now()
-                target_hour, target_minute = map(int, self.push_time.split(":"))
+                target_hour, target_minute = self.push_hour, self.push_minute
                 current_hour = now.hour
                 current_minute = now.minute
                 
@@ -340,7 +448,7 @@ class DailyNewsPlugin(Star):
                 except Exception as send_error:
                     logger.error(f"[每日早报] 推送过程中出错: {send_error}")
                     logger.error(f"[每日早报] 推送错误类型: {type(send_error).__name__}")
-                    traceback.print_exc()
+                    logger.exception("[每日早报] 推送过程中异常")
                     # 推送失败不影响下次定时，继续循环
 
                 # 推送完成后，立即重新计算下次推送时间（不等待60秒）
@@ -354,8 +462,7 @@ class DailyNewsPlugin(Star):
             except Exception as e:
                 logger.error(f"[每日早报] 定时任务出错: {e}")
                 logger.error(f"[每日早报] 错误类型: {type(e).__name__}")
-                logger.error(f"[每日早报] 错误详情:")
-                traceback.print_exc()
+                logger.exception("[每日早报] 定时任务异常")
                 # 出错后等待5分钟再重试
                 logger.info("[每日早报] 等待300秒后重试...")
                 await asyncio.sleep(300)
@@ -363,14 +470,18 @@ class DailyNewsPlugin(Star):
     @filter.command("get_status", alias={'获取状态', 'status', '状态'})
     async def check_status(self, event: AstrMessageEvent):
         """检查插件状态"""
+        self._ensure_daily_task_started()
         now = datetime.datetime.now()
-        sleep_time = self.calculate_sleep_time()
+        try:
+            sleep_time = self.calculate_sleep_time()
+        except Exception:
+            sleep_time = 0
         hours = int(sleep_time / 3600)
         minutes = int((sleep_time % 3600) / 60)
         
         # 检查定时任务状态
-        task_running = not self._daily_task.done() if self._daily_task else False
-        task_cancelled = self._daily_task.cancelled() if self._daily_task else False
+        task_running = bool(self._daily_task) and (not self._daily_task.done())
+        task_cancelled = bool(self._daily_task) and self._daily_task.cancelled()
         
         status_msg = (
             f"每日60s早报插件状态\n"
@@ -397,6 +508,7 @@ class DailyNewsPlugin(Star):
     async def get_config(self, event: AstrMessageEvent):
         """获取当前群组的正确配置"""
         try:
+            self._ensure_daily_task_started()
             current_origin = event.unified_msg_origin
             logger.info(f"[获取群组ID] 当前消息来源: {current_origin}")
             
@@ -423,7 +535,7 @@ class DailyNewsPlugin(Star):
             yield event.plain_result(help_msg)
         except Exception as e:
             logger.error(f"[获取群组ID] 出错: {e}")
-            traceback.print_exc()
+            logger.exception("[获取群组ID] 异常")
             yield event.plain_result(f"获取失败: {str(e)}")
         finally:
             event.stop_event()
@@ -433,6 +545,7 @@ class DailyNewsPlugin(Star):
     async def send_test(self, event: AstrMessageEvent):
         """测试向配置的群组发送今日早报图片"""
         try:
+            self._ensure_daily_task_started()
             if not self.target_groups:
                 yield event.plain_result("❌ 未配置目标群组")
                 return
@@ -505,7 +618,7 @@ class DailyNewsPlugin(Star):
                 except Exception as e:
                     logger.error(f"[测试] 向群组 {group_id} 发送失败: {e}")
                     logger.error(f"[测试] 错误类型: {type(e).__name__}")
-                    traceback.print_exc()
+                    logger.exception(f"[测试] 发送失败，群组: {group_id}")
                     test_results.append(f"❌ {group_id}: 异常 ({str(e)})")
             
             result_msg = "测试结果:" + "\n".join(test_results)
@@ -513,7 +626,7 @@ class DailyNewsPlugin(Star):
 
         except Exception as e:
             logger.error(f"[测试] 测试发送出错: {e}")
-            traceback.print_exc()
+            logger.exception("[测试] 测试发送出错")
             yield event.plain_result(f"测试失败: {str(e)}")
         finally:
             event.stop_event()
@@ -528,73 +641,83 @@ class DailyNewsPlugin(Star):
             mode: 获取模式，可选值: image(仅图片)/text(仅文本)/all(图片+文本)
         """
         try:
-            # 保存原始配置
-            original_show_text = self.show_text_news
+            self._ensure_daily_task_started()
 
-            # 根据命令参数临时调整配置
-            if mode == "text":
-                self.show_text_news = True  # 仅文本模式，启用文本显示
-            elif mode == "image":
-                self.show_text_news = False  # 仅图片模式，禁用文本显示
-            elif mode == "all":
-                self.show_text_news = True  # 全部模式，启用文本显示
+            mode = (mode or "all").strip().lower()
+            if mode not in {"image", "text", "all"}:
+                yield event.plain_result("❌ 模式参数非法，可选: image/text/all")
+                return
 
-            # 直接调用日常推送逻辑
+            send_image = mode in {"image", "all"}
+            send_text = mode in {"text", "all"}
+
+            logger.info(f"[每日早报] 手动获取早报，模式: {mode}")
+
             logger.info(f"[每日早报] 手动获取早报，模式: {mode}")
             try:
                 news_data = await self.fetch_news_data()
                 logger.debug(f"[每日早报] 获取到的早报数据: {news_data}")
-                if not self.use_local_image_draw:
-                    image_data = await self.download_image(news_data)
-                else:
-                    image_data = create_news_image_from_data(news_data, logger)
+                if not news_data:
+                    yield event.plain_result("❌ 获取早报数据失败")
+                    return
+
+                origin = event.unified_msg_origin
+                image_data = None
+
+                if send_image:
+                    # 生成/下载图片（失败不影响文本发送）
+                    if not self.use_local_image_draw:
+                        image_data = await self.download_image(news_data)
+                    else:
+                        image_data = create_news_image_from_data(news_data, logger)
+
                     if not image_data:
                         logger.error("[每日早报] 图片生成失败")
-                        yield event.plain_result("❌ 图片生成失败，请检查字体文件是否存在于 assets 目录中")
-                        return
-                    logger.debug(
-                        f"[图片生成] 生成的图片 Base64 数据前 100 字符: {image_data[:100]}"
-                    )
+                        yield event.plain_result("⚠️ 图片生成失败，请检查字体文件是否存在于 assets 目录中")
 
-                logger.info(
-                    f"[每日早报] 准备向 {event.unified_msg_origin} 发送每日早报"
-                )
+                    if image_data:
+                        logger.debug(f"[图片生成] 生成的图片 Base64 数据前 100 字符: {image_data[:100]}")
 
-                try:
-                    # 首先发送图片
-                    image_message_chain = MessageChain()
-                    image_message = [Image.fromBase64(image_data)]
-                    image_message_chain.chain = image_message
-                    logger.info(f"[每日早报] 向 {event.unified_msg_origin} 发送图片")
-                    await self.context.send_message(event.unified_msg_origin, image_message_chain)
+                # 发送图片
+                if send_image and image_data:
+                    image_message_chain = self._build_image_chain(image_data)
+                    logger.info(f"[每日早报] 向 {origin} 发送图片")
+                    try:
+                        await self._send_message_safely(origin, image_message_chain)
+                    except Exception:
+                        logger.exception(f"[每日早报] 向 {origin} 发送图片失败")
 
-                    # 如果配置了显示文本早报，则发送文本
-                    if self.show_text_news:
-                        text_message_chain = MessageChain()
-                        text_news = self.generate_news_text(news_data)
-                        text_message = [Plain(text_news)]
-                        text_message_chain.chain = text_message
-                        await self.context.send_message(event.unified_msg_origin, text_message_chain)
+                # 发送文本
+                if send_text:
+                    text_news = self.generate_news_text(news_data)
+                    text_message_chain = self._build_text_chain(text_news)
+                    logger.info(f"[每日早报] 向 {origin} 发送文本")
+                    try:
+                        await self._send_message_safely(origin, text_message_chain)
+                    except Exception:
+                        logger.exception(f"[每日早报] 向 {origin} 发送文本失败")
 
-                    logger.info(f"[每日早报] 已向 {event.unified_msg_origin} 发送每日早报")
-                    await asyncio.sleep(1)
-                except Exception as e:
-                    logger.error(f"[每日早报] 向 {event.unified_msg_origin} 发送消息时出错: {e}")
-                    traceback.print_exc()
+                logger.info(f"[每日早报] 已向 {origin} 发送每日早报（模式: {mode}）")
+                await asyncio.sleep(1)
             except Exception as e:
                 logger.error(f"[每日早报] 发送每日早报时出错: {e}")
-                traceback.print_exc()
-
-            # 恢复原始配置
-            self.show_text_news = original_show_text
+                logger.exception("[每日早报] 发送每日早报异常")
 
         except Exception as e:
             logger.error(f"[每日早报] 手动获取早报时出错: {e}")
-            traceback.print_exc()
+            logger.exception("[每日早报] 手动获取早报异常")
             yield event.plain_result(f"获取早报失败: {str(e)}")
         finally:
             event.stop_event()
 
     async def terminate(self):
         """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
+        if self._daily_task is None:
+            return
         self._daily_task.cancel()
+        try:
+            await self._daily_task
+        except asyncio.CancelledError:
+            logger.info("[每日早报] 定时任务已取消并退出")
+        except Exception:
+            logger.exception("[每日早报] terminate 时捕获到异常")
